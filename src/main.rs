@@ -3,6 +3,7 @@ use azalea::{
     entity::{Dead, LocalEntity, Position, metadata::ZombifiedPiglin},
     inventory::{ItemStack, Menu, components::Food, operations::SwapClick},
     prelude::*,
+    protocol::packets::game::{ServerboundUseItem, s_interact::InteractionHand},
     registry::builtin::ItemKind,
 };
 use clap::Parser;
@@ -209,7 +210,7 @@ fn eat_if_needed(bot: &Client, hunger: u32) -> eyre::Result<bool> {
         }
 
         println!("Eating food at hunger level {hunger}");
-        bot.start_use_item();
+        use_food(&bot)?;
         bot.query_self::<&mut State, _>(|mut state| {
             state.eat_cooldown_ticks = FOOD_CONSUMPTION_TICKS;
         })?;
@@ -229,6 +230,17 @@ fn eat_if_needed(bot: &Client, hunger: u32) -> eyre::Result<bool> {
         "Moving food from inventory slot {food_inventory_slot} to hotbar slot {food_hotbar_slot}"
     );
     Ok(true)
+}
+
+fn use_food(bot: &Client) -> eyre::Result<()> {
+    let direction = bot.direction()?;
+    bot.write_packet(ServerboundUseItem {
+        hand: InteractionHand::MainHand,
+        seq: 0,
+        y_rot: direction.y_rot(),
+        x_rot: direction.x_rot(),
+    });
+    Ok(())
 }
 
 fn find_food_hotbar_slot(menu: &Menu) -> Option<u8> {

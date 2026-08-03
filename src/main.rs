@@ -1,9 +1,12 @@
 use azalea::{
     auto_reconnect::AutoReconnectDelay,
     ecs::prelude::{With, Without},
-    entity::{Dead, LocalEntity, Position, metadata::ZombifiedPiglin},
+    entity::{
+        Dead, LocalEntity, Position, inventory::Inventory as PlayerInventory,
+        metadata::ZombifiedPiglin,
+    },
     inventory::{
-        ItemStack, Menu,
+        ItemStack, Menu, Player,
         components::{Damage, Food, MaxDamage},
         operations::SwapClick,
     },
@@ -21,6 +24,8 @@ const DEFAULT_MIN_DURABILITY: i32 = 20;
 const EAT_BELOW_HUNGER: u32 = 17;
 const FOOD_CONSUMPTION_TICKS: u8 = 32;
 const INVENTORY_WAIT_TICKS: usize = 100;
+const OFFHAND_SWAP_TARGET: u8 = 40;
+const TOTEM_SWAP_WAIT_TICKS: u8 = 5;
 
 #[derive(Clone, Component, Default)]
 struct State {
@@ -30,6 +35,7 @@ struct State {
     eat_cooldown_ticks: u8,
     no_target_ticks: u16,
     shutdown_after_disconnect: bool,
+    totem_swap_cooldown_ticks: u8,
 }
 
 #[derive(Debug, Parser)]
@@ -78,6 +84,7 @@ async fn main() -> AppExit {
             eat_cooldown_ticks: 0,
             no_target_ticks: 0,
             shutdown_after_disconnect: false,
+            totem_swap_cooldown_ticks: 0,
         })
         .start(account, args.server)
         .await
@@ -165,6 +172,10 @@ fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
                 "Health is {health:.1}; minimum is {min_health:.1}. Disconnecting and stopping."
             ),
         )?;
+        return Ok(());
+    }
+
+    if ensure_totem_offhand(&bot)? {
         return Ok(());
     }
 
@@ -318,6 +329,48 @@ fn request_safe_shutdown(bot: &Client, message: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+fn ensure_totem_offhand(bot: &Client) -> eyre::Result<bool> {
+    let cooldown = bot.query_self::<&mut State, _>(|mut state| {
+        if state.totem_swap_cooldown_ticks > 0 {
+            state.totem_swap_cooldown_ticks -= 1;
+            true
+        } else {
+            false
+        }
+    })?;
+    if cooldown {
+        return Ok(true);
+    }
+
+    let offhand_is_totem = bot.query_self::<&PlayerInventory, _>(|inventory| {
+        inventory
+            .inventory_menu
+            .slot(Player::OFFHAND_SLOT)
+            .is_some_and(is_totem)
+    })?;
+    if offhand_is_totem {
+        return Ok(false);
+    }
+
+    let menu = bot.menu()?;
+    let Some(source_slot) = menu
+        .player_slots_range()
+        .find(|&slot| menu.slot(slot).is_some_and(is_totem))
+    else {
+        return Ok(false);
+    };
+
+    bot.get_inventory()?.click(SwapClick {
+        source_slot: source_slot as u16,
+        target_slot: OFFHAND_SWAP_TARGET,
+    });
+    bot.query_self::<&mut State, _>(|mut state| {
+        state.totem_swap_cooldown_ticks = TOTEM_SWAP_WAIT_TICKS;
+    })?;
+    println!("Moving a Totem of Undying from inventory slot {source_slot} to the offhand.");
+    Ok(true)
+}
+
 fn slot_zero_item(bot: &Client) -> eyre::Result<ItemStack> {
     let menu = bot.menu()?;
     let hotbar_start = *menu.hotbar_slots_range().start();
@@ -359,6 +412,10 @@ fn food_target_hotbar_slot(menu: &Menu) -> u8 {
 
 fn is_food(item: &ItemStack) -> bool {
     item.kind() != ItemKind::RottenFlesh && item.get_component::<Food>().is_some()
+}
+
+fn is_totem(item: &ItemStack) -> bool {
+    item.kind() == ItemKind::TotemOfUndying
 }
 
 fn is_sword(item: ItemKind) -> bool {
@@ -434,6 +491,12 @@ mod tests {
     fn rejects_rotten_flesh_as_food() {
         assert!(!is_food(&ItemStack::from(ItemKind::RottenFlesh)));
         assert!(is_food(&ItemStack::from(ItemKind::Bread)));
+    }
+
+    #[test]
+    fn recognizes_totems() {
+        assert!(is_totem(&ItemStack::from(ItemKind::TotemOfUndying)));
+        assert!(!is_totem(&ItemStack::from(ItemKind::Bread)));
     }
 
     #[test]

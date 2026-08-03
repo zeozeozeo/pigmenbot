@@ -9,3 +9,7 @@ minecraft pigmen farm bot uzing [azalea-rs](https://github.com/azalea-rs/azalea)
 2. Put the sword in your first hotbar slot, and put food in any other inventory slot
 3. Disconnect from the server
 4. Run `cargo run --release -- --server <server-ip> --username <username> --login-password [your-password-optional]`. Currently only offline mode is supported
+
+the bot will disconnect if any is true:
+- health is <= 3 hearts
+- the sword is about to break (<= 20 durability)

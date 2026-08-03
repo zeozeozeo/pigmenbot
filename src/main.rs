@@ -1,7 +1,11 @@
 use azalea::{
     ecs::prelude::{With, Without},
     entity::{Dead, LocalEntity, Position, metadata::ZombifiedPiglin},
-    inventory::{ItemStack, Menu, components::Food, operations::SwapClick},
+    inventory::{
+        ItemStack, Menu,
+        components::{Damage, Food, MaxDamage},
+        operations::SwapClick,
+    },
     prelude::*,
     protocol::packets::game::{ServerboundUseItem, s_interact::InteractionHand},
     registry::builtin::ItemKind,
@@ -9,6 +13,7 @@ use azalea::{
 use clap::Parser;
 
 const DEFAULT_MIN_HEALTH: f32 = 6.0;
+const DEFAULT_MIN_DURABILITY: i32 = 20;
 const EAT_BELOW_HUNGER: u32 = 17;
 const FOOD_CONSUMPTION_TICKS: u8 = 32;
 const INVENTORY_WAIT_TICKS: usize = 100;
@@ -17,6 +22,7 @@ const INVENTORY_WAIT_TICKS: usize = 100;
 struct State {
     login_password: Option<String>,
     min_health: f32,
+    min_durability: i32,
     eat_cooldown_ticks: u8,
     no_target_ticks: u16,
 }
@@ -42,6 +48,10 @@ struct Args {
     /// Disconnect and stop when health reaches this value (default: 6.0, or 3 hearts).
     #[arg(long, value_name = "HEALTH", default_value_t = DEFAULT_MIN_HEALTH)]
     min_health: f32,
+
+    /// Stop before the sword has this much durability remaining (default: 20).
+    #[arg(long, value_name = "DURABILITY", default_value_t = DEFAULT_MIN_DURABILITY)]
+    min_durability: i32,
 }
 
 #[tokio::main]
@@ -59,6 +69,7 @@ async fn main() -> AppExit {
         .set_state(State {
             login_password: args.login_password,
             min_health: args.min_health,
+            min_durability: args.min_durability,
             eat_cooldown_ticks: 0,
             no_target_ticks: 0,
         })
@@ -70,7 +81,7 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
     match event {
         Event::Login => println!("Server login packet received."),
         Event::Spawn => initialize(bot, state).await?,
-        Event::Tick => tick(bot, state.min_health)?,
+        Event::Tick => tick(bot, state.min_health, state.min_durability)?,
         Event::Chat(chat) => println!("Chat: {}", chat.message().to_ansi()),
         Event::Disconnect(reason) => {
             println!(
@@ -123,10 +134,23 @@ fn log_slot_zero(item: ItemKind) {
     }
 }
 
-fn tick(bot: Client, min_health: f32) -> eyre::Result<()> {
+fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
     let health = bot.health()?;
     if should_disconnect(health, min_health) {
         println!("Health is {health:.1}; minimum is {min_health:.1}. Disconnecting and stopping.");
+        bot.disconnect();
+        bot.exit();
+        return Ok(());
+    }
+
+    let slot_zero = slot_zero_item(&bot)?;
+    if is_sword(slot_zero.kind())
+        && let Some(remaining) = remaining_durability(&slot_zero)
+        && remaining <= min_durability
+    {
+        println!(
+            "Sword has {remaining} durability remaining (minimum is {min_durability}); disconnecting and stopping."
+        );
         bot.disconnect();
         bot.exit();
         return Ok(());
@@ -243,6 +267,20 @@ fn use_food(bot: &Client) -> eyre::Result<()> {
     Ok(())
 }
 
+fn slot_zero_item(bot: &Client) -> eyre::Result<ItemStack> {
+    let menu = bot.menu()?;
+    let hotbar_start = *menu.hotbar_slots_range().start();
+    Ok(menu.slot(hotbar_start).cloned().unwrap_or(ItemStack::Empty))
+}
+
+fn remaining_durability(item: &ItemStack) -> Option<i32> {
+    let max_durability = item.get_component::<MaxDamage>()?.amount;
+    let damage = item
+        .get_component::<Damage>()
+        .map_or(0, |component| component.amount);
+    Some(max_durability - damage)
+}
+
 fn find_food_hotbar_slot(menu: &Menu) -> Option<u8> {
     menu.hotbar_slots_range()
         .enumerate()
@@ -345,5 +383,11 @@ mod tests {
     fn rejects_rotten_flesh_as_food() {
         assert!(!is_food(&ItemStack::from(ItemKind::RottenFlesh)));
         assert!(is_food(&ItemStack::from(ItemKind::Bread)));
+    }
+
+    #[test]
+    fn calculates_remaining_sword_durability() {
+        let item = ItemStack::from(ItemKind::DiamondSword).with_component(Damage { amount: 1545 });
+        assert_eq!(remaining_durability(&item), Some(16));
     }
 }

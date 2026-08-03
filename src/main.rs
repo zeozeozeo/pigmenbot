@@ -1,9 +1,11 @@
+use azalea::Vec3;
 use azalea::{
     auto_reconnect::AutoReconnectDelay,
+    core::aabb::Aabb,
     ecs::prelude::{With, Without},
     entity::{
-        Dead, LocalEntity, Position, inventory::Inventory as PlayerInventory,
-        metadata::ZombifiedPiglin,
+        Dead, LocalEntity, Position, dimensions::EntityDimensions,
+        inventory::Inventory as PlayerInventory, metadata::ZombifiedPiglin,
     },
     inventory::{
         ItemStack, Menu, Player,
@@ -212,16 +214,20 @@ fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
     }
 
     let bot_position = bot.eye_position()?;
-    let target = bot.nearest_entity_by::<&Position, (
+    let attack_reach = bot.attributes()?.entity_interaction_range.calculate();
+    let target = bot.nearest_entity_by::<(&Position, &EntityDimensions), (
         With<ZombifiedPiglin>,
         Without<LocalEntity>,
         Without<Dead>,
-    )>(|position: &Position| bot_position.distance_to(**position) < 3.0)?;
+    )>(|(position, dimensions): (&Position, &EntityDimensions)| {
+        let bounding_box = dimensions.make_bounding_box(**position);
+        distance_to_aabb(bot_position, &bounding_box) <= attack_reach
+    })?;
 
     let Some(target) = target else {
         if should_log_no_target(&bot)? {
             println!(
-                "Combat loop active but no zombified piglin is within 3 blocks (health {health:.1}, hunger {hunger})."
+                "Combat loop active but no zombified piglin is within {attack_reach:.2} blocks of entity reach (health {health:.1}, hunger {hunger})."
             );
         }
         return Ok(());
@@ -239,6 +245,23 @@ fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+fn distance_to_aabb(point: Vec3, bounding_box: &Aabb) -> f64 {
+    fn axis_distance(value: f64, min: f64, max: f64) -> f64 {
+        if value < min {
+            min - value
+        } else if value > max {
+            value - max
+        } else {
+            0.0
+        }
+    }
+
+    let dx = axis_distance(point.x, bounding_box.min.x, bounding_box.max.x);
+    let dy = axis_distance(point.y, bounding_box.min.y, bounding_box.max.y);
+    let dz = axis_distance(point.z, bounding_box.min.z, bounding_box.max.z);
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 fn should_log_no_target(bot: &Client) -> eyre::Result<bool> {

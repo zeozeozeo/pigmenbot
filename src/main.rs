@@ -11,13 +11,10 @@ use azalea::{
         operations::SwapClick,
     },
     prelude::*,
-    protocol::packets::game::{
-        ClientboundGamePacket, ServerboundUseItem, s_interact::InteractionHand,
-    },
+    protocol::packets::game::{ServerboundUseItem, s_interact::InteractionHand},
     registry::builtin::ItemKind,
 };
 use clap::Parser;
-use std::time::Duration;
 
 const DEFAULT_MIN_HEALTH: f32 = 6.0;
 const DEFAULT_MIN_DURABILITY: i32 = 20;
@@ -36,6 +33,7 @@ struct State {
     no_target_ticks: u16,
     shutdown_after_disconnect: bool,
     totem_swap_cooldown_ticks: u8,
+    farm_ready: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -85,6 +83,7 @@ async fn main() -> AppExit {
             no_target_ticks: 0,
             shutdown_after_disconnect: false,
             totem_swap_cooldown_ticks: 0,
+            farm_ready: false,
         })
         .start(account, args.server)
         .await
@@ -95,16 +94,6 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
         Event::Login => println!("Server login packet received."),
         Event::Spawn => initialize(bot, state).await?,
         Event::Tick => tick(bot, state.min_health, state.min_durability)?,
-        Event::Packet(packet) => {
-            if let ClientboundGamePacket::DamageEvent(damage) = packet.as_ref()
-                && damage.entity_id == bot.minecraft_id()?
-            {
-                request_safe_shutdown(
-                    &bot,
-                    "Damage packet received; disconnecting before the health update can arrive.",
-                )?;
-            }
-        }
         Event::Chat(chat) => println!("Chat: {}", chat.message().to_ansi()),
         Event::Disconnect(reason) => {
             println!(
@@ -128,6 +117,7 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
 }
 
 async fn initialize(bot: Client, state: State) -> eyre::Result<()> {
+    set_farm_ready(&bot, false)?;
     bot.set_selected_hotbar_slot(0);
 
     if let Some(password) = state.login_password.as_deref() {
@@ -141,6 +131,7 @@ async fn initialize(bot: Client, state: State) -> eyre::Result<()> {
         let held_item = bot.get_held_item()?;
         if held_item.kind() != ItemKind::Air {
             log_slot_zero(held_item.kind());
+            set_farm_ready(&bot, true)?;
             return Ok(());
         }
         bot.wait_ticks(1).await;
@@ -150,6 +141,7 @@ async fn initialize(bot: Client, state: State) -> eyre::Result<()> {
         "No item appeared in hotbar slot 0 after {INVENTORY_WAIT_TICKS} ticks; the inventory may not have synchronized after login."
     );
     log_slot_zero(bot.get_held_item()?.kind());
+    set_farm_ready(&bot, true)?;
     Ok(())
 }
 
@@ -164,6 +156,10 @@ fn log_slot_zero(item: ItemKind) {
 }
 
 fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
+    if !bot.query_self::<&State, _>(|state| state.farm_ready)? {
+        return Ok(());
+    }
+
     let health = bot.health()?;
     if should_disconnect(health, min_health) {
         request_safe_shutdown(
@@ -319,10 +315,7 @@ fn request_safe_shutdown(bot: &Client, message: &str) -> eyre::Result<()> {
 
     if should_disconnect {
         println!("{message}");
-        bot.ecs
-            .write()
-            .entity_mut(bot.entity)
-            .insert(AutoReconnectDelay::new(Duration::MAX));
+        bot.ecs.write().remove_resource::<AutoReconnectDelay>();
         bot.disconnect();
     }
 
@@ -369,6 +362,13 @@ fn ensure_totem_offhand(bot: &Client) -> eyre::Result<bool> {
     })?;
     println!("Moving a Totem of Undying from inventory slot {source_slot} to the offhand.");
     Ok(true)
+}
+
+fn set_farm_ready(bot: &Client, ready: bool) -> eyre::Result<()> {
+    bot.query_self::<&mut State, _>(|mut state| {
+        state.farm_ready = ready;
+    })?;
+    Ok(())
 }
 
 fn slot_zero_item(bot: &Client) -> eyre::Result<ItemStack> {

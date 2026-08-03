@@ -1,4 +1,5 @@
 use azalea::{
+    auto_reconnect::AutoReconnectDelay,
     ecs::prelude::{With, Without},
     entity::{Dead, LocalEntity, Position, metadata::ZombifiedPiglin},
     inventory::{
@@ -7,10 +8,13 @@ use azalea::{
         operations::SwapClick,
     },
     prelude::*,
-    protocol::packets::game::{ServerboundUseItem, s_interact::InteractionHand},
+    protocol::packets::game::{
+        ClientboundGamePacket, ServerboundUseItem, s_interact::InteractionHand,
+    },
     registry::builtin::ItemKind,
 };
 use clap::Parser;
+use std::time::Duration;
 
 const DEFAULT_MIN_HEALTH: f32 = 6.0;
 const DEFAULT_MIN_DURABILITY: i32 = 20;
@@ -25,6 +29,7 @@ struct State {
     min_durability: i32,
     eat_cooldown_ticks: u8,
     no_target_ticks: u16,
+    shutdown_after_disconnect: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -72,6 +77,7 @@ async fn main() -> AppExit {
             min_durability: args.min_durability,
             eat_cooldown_ticks: 0,
             no_target_ticks: 0,
+            shutdown_after_disconnect: false,
         })
         .start(account, args.server)
         .await
@@ -82,12 +88,28 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
         Event::Login => println!("Server login packet received."),
         Event::Spawn => initialize(bot, state).await?,
         Event::Tick => tick(bot, state.min_health, state.min_durability)?,
+        Event::Packet(packet) => {
+            if let ClientboundGamePacket::DamageEvent(damage) = packet.as_ref()
+                && damage.entity_id == bot.minecraft_id()?
+            {
+                request_safe_shutdown(
+                    &bot,
+                    "Damage packet received; disconnecting before the health update can arrive.",
+                )?;
+            }
+        }
         Event::Chat(chat) => println!("Chat: {}", chat.message().to_ansi()),
         Event::Disconnect(reason) => {
             println!(
                 "Disconnected: {}",
                 reason.map_or_else(|| "unknown reason".into(), |r| r.to_string())
             );
+            if bot
+                .query_self::<&State, _>(|state| state.shutdown_after_disconnect)
+                .unwrap_or(false)
+            {
+                bot.exit();
+            }
         }
         Event::ConnectionFailed(error) => {
             eprintln!("Connection failed: {error}");
@@ -137,9 +159,12 @@ fn log_slot_zero(item: ItemKind) {
 fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
     let health = bot.health()?;
     if should_disconnect(health, min_health) {
-        println!("Health is {health:.1}; minimum is {min_health:.1}. Disconnecting and stopping.");
-        bot.disconnect();
-        bot.exit();
+        request_safe_shutdown(
+            &bot,
+            &format!(
+                "Health is {health:.1}; minimum is {min_health:.1}. Disconnecting and stopping."
+            ),
+        )?;
         return Ok(());
     }
 
@@ -151,8 +176,12 @@ fn tick(bot: Client, min_health: f32, min_durability: i32) -> eyre::Result<()> {
         println!(
             "Sword has {remaining} durability remaining (minimum is {min_durability}); disconnecting and stopping."
         );
-        bot.disconnect();
-        bot.exit();
+        request_safe_shutdown(
+            &bot,
+            &format!(
+                "Sword has {remaining} durability remaining (minimum is {min_durability}); disconnecting and stopping."
+            ),
+        )?;
         return Ok(());
     }
 
@@ -234,7 +263,7 @@ fn eat_if_needed(bot: &Client, hunger: u32) -> eyre::Result<bool> {
         }
 
         println!("Eating food at hunger level {hunger}");
-        use_food(&bot)?;
+        use_food(bot)?;
         bot.query_self::<&mut State, _>(|mut state| {
             state.eat_cooldown_ticks = FOOD_CONSUMPTION_TICKS;
         })?;
@@ -264,6 +293,28 @@ fn use_food(bot: &Client) -> eyre::Result<()> {
         y_rot: direction.y_rot(),
         x_rot: direction.x_rot(),
     });
+    Ok(())
+}
+
+fn request_safe_shutdown(bot: &Client, message: &str) -> eyre::Result<()> {
+    let should_disconnect = bot.query_self::<&mut State, _>(|mut state| {
+        if state.shutdown_after_disconnect {
+            false
+        } else {
+            state.shutdown_after_disconnect = true;
+            true
+        }
+    })?;
+
+    if should_disconnect {
+        println!("{message}");
+        bot.ecs
+            .write()
+            .entity_mut(bot.entity)
+            .insert(AutoReconnectDelay::new(Duration::MAX));
+        bot.disconnect();
+    }
+
     Ok(())
 }
 

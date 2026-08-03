@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-azalea = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19", default-features = false, features = ["log"] }
+azalea = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19", default-features = false, features = ["log", "packet-event"] }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

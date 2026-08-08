@@ -54,6 +54,7 @@ const ALERT_GROUP_WINDOW_TICKS: u16 = 20;
 const MAP_INITIAL_DELAY_TICKS: u16 = 60 * TICKS_PER_SECOND as u16;
 const MAP_REPORT_INTERVAL_TICKS: u16 = 30 * TICKS_PER_SECOND as u16;
 const MAP_TRIGGER_SECRET: &str = "qmmnhn9ptd";
+const DEFAULT_TERRAIN_SAMPLE_BLOCKS: u32 = 4;
 const MAP_SIZE: u32 = 1024;
 const MAX_BREADCRUMB_POINTS: usize = 300;
 const PLAYER_MAP_COLORS: [[u8; 3]; 8] = [
@@ -78,6 +79,7 @@ enum Mode {
 struct NotifierConfig {
     webhook_url: String,
     render_distance: f64,
+    terrain_sample_blocks: i32,
     false_alarm_ticks: u64,
     whitelist: HashSet<String>,
     whitelist_offline_uuids: HashSet<String>,
@@ -114,6 +116,7 @@ struct MapSnapshot {
     base_x: f64,
     base_z: f64,
     radius: f64,
+    terrain_sample_blocks: i32,
     players: Vec<TrackedPlayer>,
     breadcrumbs: HashMap<String, Vec<(f64, f64)>>,
 }
@@ -206,6 +209,15 @@ struct Args {
     )]
     render_distance: f64,
 
+    /// Terrain samples per map cell: 1 samples every block, 4 is faster (default: 4).
+    #[arg(
+        long,
+        env = "PIGMEN_TERRAIN_SAMPLE_BLOCKS",
+        value_name = "BLOCKS",
+        default_value_t = DEFAULT_TERRAIN_SAMPLE_BLOCKS
+    )]
+    terrain_sample_blocks: u32,
+
     /// Seconds an intruder must remain outside before a false-alarm message (default: 180).
     #[arg(
         long,
@@ -272,6 +284,10 @@ async fn main() -> AppExit {
                 eprintln!("--render-distance must be a positive finite number.");
                 return AppExit::error();
             }
+            if args.terrain_sample_blocks == 0 {
+                eprintln!("--terrain-sample-blocks must be at least 1.");
+                return AppExit::error();
+            }
             if args.alert_repeats == 0 {
                 eprintln!("--alert-repeats must be at least 1.");
                 return AppExit::error();
@@ -280,6 +296,7 @@ async fn main() -> AppExit {
             Some(NotifierConfig {
                 webhook_url,
                 render_distance: args.render_distance,
+                terrain_sample_blocks: args.terrain_sample_blocks as i32,
                 false_alarm_ticks: args
                     .false_alarm_seconds
                     .saturating_mul(TICKS_PER_SECOND)
@@ -828,6 +845,7 @@ fn maybe_start_map_report(
             base_x: bot_position.x,
             base_z: bot_position.z,
             radius: config.render_distance,
+            terrain_sample_blocks: config.terrain_sample_blocks,
             players: state.tracked_players.values().cloned().collect(),
             breadcrumbs: state.breadcrumbs.clone(),
         })
@@ -900,6 +918,7 @@ fn spawn_map_report(bot: Client, webhook_url: String, snapshot: MapSnapshot) {
                     &snapshot,
                     world.chunks.min_y(),
                     world.chunks.min_y() + world.chunks.height() as i32,
+                    snapshot.terrain_sample_blocks,
                 )
             };
             let png = render_map_png(&client, &snapshot, terrain).await?;
@@ -1104,8 +1123,6 @@ fn player_map_color(id: &str, alpha: u8) -> Rgba<u8> {
     Rgba([color[0], color[1], color[2], alpha])
 }
 
-const TERRAIN_SAMPLE_BLOCKS: i32 = 4;
-
 #[derive(Clone, Copy)]
 struct TerrainSample {
     y: i32,
@@ -1117,18 +1134,20 @@ fn render_terrain(
     snapshot: &MapSnapshot,
     min_y: i32,
     max_y: i32,
+    sample_blocks: i32,
 ) -> RgbaImage {
     let mut image = RgbaImage::from_pixel(MAP_SIZE, MAP_SIZE, Rgba([55, 62, 68, 255]));
     let span = (snapshot.radius * 2.0).ceil() as i32;
-    let cells = ((span + TERRAIN_SAMPLE_BLOCKS - 1) / TERRAIN_SAMPLE_BLOCKS).max(1);
+    let sample_blocks = sample_blocks.max(1);
+    let cells = ((span + sample_blocks - 1) / sample_blocks).max(1);
     let mut samples = vec![None; (cells * cells) as usize];
     let start_x = (snapshot.base_x - snapshot.radius).floor() as i32;
     let start_z = (snapshot.base_z - snapshot.radius).floor() as i32;
 
     for cell_z in 0..cells {
         for cell_x in 0..cells {
-            let x = start_x + cell_x * TERRAIN_SAMPLE_BLOCKS + TERRAIN_SAMPLE_BLOCKS / 2;
-            let z = start_z + cell_z * TERRAIN_SAMPLE_BLOCKS + TERRAIN_SAMPLE_BLOCKS / 2;
+            let x = start_x + cell_x * sample_blocks + sample_blocks / 2;
+            let z = start_z + cell_z * sample_blocks + sample_blocks / 2;
             samples[(cell_z * cells + cell_x) as usize] = sample_surface(world, x, z, min_y, max_y);
         }
     }

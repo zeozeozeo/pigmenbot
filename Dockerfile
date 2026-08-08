@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /usr/src/pigmenfarm
 COPY Cargo.toml Cargo.lock ./
@@ -12,7 +12,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin pigmenfarm \
     && mkdir /data \

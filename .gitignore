@@ -1,1 +1,6 @@
 /target
+/target-map
+*.bat
+/players.json
+/data/
+.env

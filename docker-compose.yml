@@ -1,5 +1,5 @@
 services:
-  pigmenfarm:
+  pigmenbot:
     image: ghcr.io/zeozeozeo/pigmenbot:latest
     platform: ${DOCKER_PLATFORM:-linux/arm64}
     container_name: pigmenbot

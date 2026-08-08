@@ -4,10 +4,20 @@ FROM rustlang/rust:nightly-bookworm AS builder
 
 WORKDIR /usr/src/pigmenfarm
 COPY Cargo.toml Cargo.lock ./
+
+# Keep dependency compilation in a source-independent layer. The GitHub
+# Actions BuildKit cache can reuse this layer when only the bot changes.
+RUN mkdir src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+
 COPY src ./src
 COPY assets ./assets
 
-RUN cargo build --release --locked
+RUN touch src/main.rs \
+    && cargo build --release --locked \
+    && cp target/release/pigmenfarm /usr/src/pigmenfarm/pigmenfarm
 
 FROM debian:bookworm-slim
 
@@ -18,7 +28,7 @@ RUN apt-get update \
     && mkdir /data \
     && chown pigmenfarm:pigmenfarm /data
 
-COPY --from=builder /usr/src/pigmenfarm/target/release/pigmenfarm /usr/local/bin/pigmenfarm
+COPY --from=builder /usr/src/pigmenfarm/pigmenfarm /usr/local/bin/pigmenfarm
 
 WORKDIR /data
 USER pigmenfarm

@@ -111,6 +111,13 @@ struct TrackedPlayer {
     skin_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Breadcrumb {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
 #[derive(Clone, Debug)]
 struct MapSnapshot {
     base_x: f64,
@@ -118,7 +125,7 @@ struct MapSnapshot {
     radius: f64,
     terrain_sample_blocks: i32,
     players: Vec<TrackedPlayer>,
-    breadcrumbs: HashMap<String, Vec<(f64, f64)>>,
+    breadcrumbs: HashMap<String, Vec<Breadcrumb>>,
 }
 
 impl PlayerDatabase {
@@ -149,7 +156,7 @@ struct State {
     alert_group_ticks: u16,
     player_database: PlayerDatabase,
     tracked_players: HashMap<String, TrackedPlayer>,
-    breadcrumbs: HashMap<String, Vec<(f64, f64)>>,
+    breadcrumbs: HashMap<String, Vec<Breadcrumb>>,
     map_report_ticks: u16,
     map_report_pending: bool,
     map_report_in_flight: bool,
@@ -701,13 +708,17 @@ async fn notifier_tick(bot: &Client) -> eyre::Result<()> {
         let breadcrumb_players: Vec<_> = state.tracked_players.values().cloned().collect();
         for player in &breadcrumb_players {
             let trail = state.breadcrumbs.entry(player.id.clone()).or_default();
-            let should_append = trail.last().is_none_or(|(x, z)| {
-                let dx = *x - player.x;
-                let dz = *z - player.z;
+            let should_append = trail.last().is_none_or(|point| {
+                let dx = point.x - player.x;
+                let dz = point.z - player.z;
                 dx * dx + dz * dz >= 4.0
             });
             if should_append {
-                trail.push((player.x, player.z));
+                trail.push(Breadcrumb {
+                    x: player.x,
+                    y: player.y,
+                    z: player.z,
+                });
                 if trail.len() > MAX_BREADCRUMB_POINTS {
                     trail.remove(0);
                 }
@@ -969,29 +980,7 @@ async fn render_map_png(
     snapshot: &MapSnapshot,
     mut canvas: RgbaImage,
 ) -> eyre::Result<Vec<u8>> {
-    let scale = MAP_SIZE as f64 / (snapshot.radius * 2.0);
-
-    let tile_size = (16.0 * scale).max(4.0) as u32;
-    for x in (0..MAP_SIZE).step_by(tile_size as usize) {
-        draw_line(
-            &mut canvas,
-            x as i32,
-            0,
-            x as i32,
-            MAP_SIZE as i32 - 1,
-            Rgba([49, 73, 44, 150]),
-        );
-    }
-    for z in (0..MAP_SIZE).step_by(tile_size as usize) {
-        draw_line(
-            &mut canvas,
-            0,
-            z as i32,
-            MAP_SIZE as i32 - 1,
-            z as i32,
-            Rgba([49, 73, 44, 150]),
-        );
-    }
+    draw_chunk_grid(&mut canvas, snapshot, Rgba([49, 73, 44, 150]));
 
     let player_by_id: HashMap<_, _> = snapshot
         .players
@@ -999,12 +988,13 @@ async fn render_map_png(
         .map(|player| (player.id.as_str(), player))
         .collect();
     for (id, trail) in &snapshot.breadcrumbs {
-        let color = player_by_id
-            .get(id.as_str())
-            .map_or(Rgba([185, 185, 185, 180]), |_| player_map_color(id, 220));
         for points in trail.windows(2) {
-            let (x1, z1) = map_point(snapshot, points[0].0, points[0].1);
-            let (x2, z2) = map_point(snapshot, points[1].0, points[1].1);
+            let color = player_by_id.get(id.as_str()).map_or_else(
+                || breadcrumb_height_color([185, 185, 185], (points[0].y + points[1].y) / 2.0, 180),
+                |_| breadcrumb_color(id, (points[0].y + points[1].y) / 2.0, 220),
+            );
+            let (x1, z1) = map_point(snapshot, points[0].x, points[0].z);
+            let (x2, z2) = map_point(snapshot, points[1].x, points[1].z);
             draw_thick_line(&mut canvas, x1, z1, x2, z2, color, 4);
         }
     }
@@ -1121,6 +1111,59 @@ fn player_map_color(id: &str, alpha: u8) -> Rgba<u8> {
     });
     let color = PLAYER_MAP_COLORS[(hash as usize) % PLAYER_MAP_COLORS.len()];
     Rgba([color[0], color[1], color[2], alpha])
+}
+
+const BREADCRUMB_MIN_Y: f64 = -64.0;
+const BREADCRUMB_MAX_Y: f64 = 320.0;
+
+fn breadcrumb_color(id: &str, y: f64, alpha: u8) -> Rgba<u8> {
+    let color = player_map_color(id, u8::MAX);
+    breadcrumb_height_color([color[0], color[1], color[2]], y, alpha)
+}
+
+fn breadcrumb_height_color(color: [u8; 3], y: f64, alpha: u8) -> Rgba<u8> {
+    let height = ((y - BREADCRUMB_MIN_Y) / (BREADCRUMB_MAX_Y - BREADCRUMB_MIN_Y)).clamp(0.0, 1.0);
+    let brightness = 0.55 + height * 0.65;
+    Rgba([
+        (f64::from(color[0]) * brightness).clamp(0.0, 255.0) as u8,
+        (f64::from(color[1]) * brightness).clamp(0.0, 255.0) as u8,
+        (f64::from(color[2]) * brightness).clamp(0.0, 255.0) as u8,
+        alpha,
+    ])
+}
+
+fn draw_chunk_grid(image: &mut RgbaImage, snapshot: &MapSnapshot, color: Rgba<u8>) {
+    let min_x = snapshot.base_x - snapshot.radius;
+    let max_x = snapshot.base_x + snapshot.radius;
+    let min_z = snapshot.base_z - snapshot.radius;
+    let max_z = snapshot.base_z + snapshot.radius;
+    let mut chunk_x = (min_x / 16.0).ceil() as i32 * 16;
+    let mut chunk_z = (min_z / 16.0).ceil() as i32 * 16;
+
+    while f64::from(chunk_x) < max_x {
+        let pixel_x = map_pixel(snapshot, f64::from(chunk_x), snapshot.base_z).0;
+        draw_line(
+            image,
+            pixel_x.round() as i32,
+            0,
+            pixel_x.round() as i32,
+            MAP_SIZE as i32 - 1,
+            color,
+        );
+        chunk_x = chunk_x.saturating_add(16);
+    }
+    while f64::from(chunk_z) < max_z {
+        let pixel_z = map_pixel(snapshot, snapshot.base_x, f64::from(chunk_z)).1;
+        draw_line(
+            image,
+            0,
+            pixel_z.round() as i32,
+            MAP_SIZE as i32 - 1,
+            pixel_z.round() as i32,
+            color,
+        );
+        chunk_z = chunk_z.saturating_add(16);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1349,6 +1392,8 @@ fn procedural_block_color(identifier: &str) -> [u8; 3] {
         [44, 42, 46]
     } else if has("basalt") {
         [79, 78, 76]
+    } else if has("copper") {
+        [184, 102, 72]
     } else if has("stone") || has("cobblestone") || has("brick") || has("slab") || has("stairs") {
         [124, 124, 124]
     } else if has("dirt") || has("root") {
@@ -1373,8 +1418,6 @@ fn procedural_block_color(identifier: &str) -> [u8; 3] {
         dye.unwrap_or([190, 190, 190])
     } else if has("glass") {
         blend_colors(dye.unwrap_or([176, 214, 219]), [210, 230, 232], 0.35)
-    } else if has("copper") {
-        [181, 99, 71]
     } else if has("iron") || has("chain") || has("anvil") {
         [183, 185, 180]
     } else if has("gold") {
@@ -1420,11 +1463,11 @@ fn procedural_block_color(identifier: &str) -> [u8; 3] {
         color = adjust_color(color, 8);
     }
     if has("weathered") {
-        color = blend_colors(color, [109, 147, 127], 0.35);
+        color = blend_colors(color, [91, 156, 132], 0.55);
     } else if has("oxidized") {
-        color = blend_colors(color, [74, 143, 126], 0.62);
+        color = blend_colors(color, [61, 157, 139], 0.78);
     } else if has("exposed") {
-        color = blend_colors(color, [159, 113, 82], 0.25);
+        color = blend_colors(color, [164, 119, 87], 0.35);
     }
     if has("mossy") || has("moss") {
         color = blend_colors(color, [75, 137, 68], 0.25);
@@ -1560,13 +1603,17 @@ async fn send_map_webhook(
 }
 
 fn map_point(snapshot: &MapSnapshot, x: f64, z: f64) -> (i32, i32) {
+    let (pixel_x, pixel_z) = map_pixel(snapshot, x, z);
+    (
+        pixel_x.round().clamp(0.0, MAP_SIZE as f64 - 1.0) as i32,
+        pixel_z.round().clamp(0.0, MAP_SIZE as f64 - 1.0) as i32,
+    )
+}
+
+fn map_pixel(snapshot: &MapSnapshot, x: f64, z: f64) -> (f64, f64) {
     let scale = MAP_SIZE as f64 / (snapshot.radius * 2.0);
-    let pixel_x = ((x - snapshot.base_x + snapshot.radius) * scale)
-        .round()
-        .clamp(0.0, MAP_SIZE as f64 - 1.0) as i32;
-    let pixel_z = ((z - snapshot.base_z + snapshot.radius) * scale)
-        .round()
-        .clamp(0.0, MAP_SIZE as f64 - 1.0) as i32;
+    let pixel_x = (x - snapshot.base_x + snapshot.radius) * scale;
+    let pixel_z = (z - snapshot.base_z + snapshot.radius) * scale;
     (pixel_x, pixel_z)
 }
 
@@ -2221,5 +2268,25 @@ mod tests {
                 assert!(color.iter().any(|channel| *channel > 0));
             }
         }
+    }
+
+    #[test]
+    fn copper_palette_is_not_generic_grey() {
+        let copper = procedural_block_color("minecraft:copper_slab");
+        let oxidized = procedural_block_color("minecraft:oxidized_copper");
+
+        assert!(copper[0] > copper[1]);
+        assert!(oxidized[1] > oxidized[0]);
+        assert!(oxidized[2] > oxidized[0]);
+    }
+
+    #[test]
+    fn higher_breadcrumbs_are_lighter() {
+        let low = breadcrumb_height_color([100, 100, 100], -64.0, 255);
+        let high = breadcrumb_height_color([100, 100, 100], 320.0, 255);
+
+        assert!(high[0] > low[0]);
+        assert!(high[1] > low[1]);
+        assert!(high[2] > low[2]);
     }
 }

@@ -1,10 +1,8 @@
 services:
   pigmenfarm:
-    # Set PIGMEN_IMAGE in .env to your published GHCR image.
-    image: ${PIGMEN_IMAGE:-ghcr.io/your-github-user/pigmenfarm:latest}
-    # Raspberry Pi OS should be 64-bit for this example.
+    image: ghcr.io/zeozeozeo/pigmenbot:latest
     platform: ${DOCKER_PLATFORM:-linux/arm64}
-    container_name: pigmenfarm
+    container_name: pigmenbot
     restart: unless-stopped
     environment:
       PIGMEN_MODE: ${PIGMEN_MODE:-farm}
@@ -21,7 +19,7 @@ services:
       PIGMEN_ALERT_REPEATS: ${PIGMEN_ALERT_REPEATS:-5}
       PIGMEN_PLAYER_DATABASE: ${PIGMEN_PLAYER_DATABASE:-/data/players.json}
     volumes:
-      - pigmenfarm_data:/data
+      - pigmenbot_data:/data
 
 volumes:
-  pigmenfarm_data:
+  pigmenbot_data:

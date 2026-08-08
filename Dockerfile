@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.97-bookworm AS builder
+FROM rust:nightly-bookworm AS builder
 
 WORKDIR /usr/src/pigmenfarm
 COPY Cargo.toml Cargo.lock ./

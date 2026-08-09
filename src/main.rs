@@ -70,6 +70,16 @@ const PLAYER_MAP_COLORS: [[u8; 3]; 8] = [
     [124, 179, 66],
     [255, 112, 181],
 ];
+const BREADCRUMB_COLORS: [[u8; 3]; 8] = [
+    [239, 83, 80],
+    [66, 165, 245],
+    [255, 202, 40],
+    [171, 71, 188],
+    [0, 188, 212],
+    [255, 112, 67],
+    [236, 64, 122],
+    [121, 85, 72],
+];
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
 enum Mode {
@@ -1151,11 +1161,15 @@ async fn render_map_png(
 }
 
 fn player_map_color(id: &str, alpha: u8) -> Rgba<u8> {
-    let hash = id.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
-        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-    });
+    let hash = map_color_hash(id);
     let color = PLAYER_MAP_COLORS[(hash as usize) % PLAYER_MAP_COLORS.len()];
     Rgba([color[0], color[1], color[2], alpha])
+}
+
+fn map_color_hash(id: &str) -> u32 {
+    id.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1234,8 +1248,8 @@ fn compact_player_points(points: &[(i32, i32)], compact: &[bool]) -> Vec<(i32, i
 }
 
 fn breadcrumb_color(id: &str, y: f64, min_y: f64, max_y: f64, alpha: u8) -> Rgba<u8> {
-    let color = player_map_color(id, u8::MAX);
-    breadcrumb_height_color([color[0], color[1], color[2]], y, min_y, max_y, alpha)
+    let color = BREADCRUMB_COLORS[(map_color_hash(id) as usize) % BREADCRUMB_COLORS.len()];
+    breadcrumb_height_color(color, y, min_y, max_y, alpha)
 }
 
 fn breadcrumb_height_color(color: [u8; 3], y: f64, min_y: f64, max_y: f64, alpha: u8) -> Rgba<u8> {

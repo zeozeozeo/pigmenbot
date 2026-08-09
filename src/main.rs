@@ -57,6 +57,9 @@ const MAP_TRIGGER_SECRET: &str = "qmmnhn9ptd";
 const DEFAULT_TERRAIN_SAMPLE_BLOCKS: u32 = 4;
 const MAP_SIZE: u32 = 1024;
 const MAX_BREADCRUMB_POINTS: usize = 300;
+/// Players closer than this on the rendered map use compact individual dots.
+/// This is deliberately in pixels, so it adapts automatically as map scale changes.
+const DENSE_PLAYER_DISTANCE_PX: i32 = 32;
 const PLAYER_MAP_COLORS: [[u8; 3]; 8] = [
     [239, 83, 80],
     [66, 165, 245],
@@ -988,14 +991,19 @@ async fn render_map_png(
         .map(|player| (player.id.as_str(), player))
         .collect();
     for (id, trail) in &snapshot.breadcrumbs {
+        let (min_y, max_y) = trail.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(min_y, max_y), point| (min_y.min(point.y), max_y.max(point.y)),
+        );
         for points in trail.windows(2) {
+            let y = (points[0].y + points[1].y) / 2.0;
             let color = player_by_id.get(id.as_str()).map_or_else(
-                || breadcrumb_height_color([185, 185, 185], (points[0].y + points[1].y) / 2.0, 180),
-                |_| breadcrumb_color(id, (points[0].y + points[1].y) / 2.0, 220),
+                || breadcrumb_height_color([185, 185, 185], y, min_y, max_y, 180),
+                |_| breadcrumb_color(id, y, min_y, max_y, 220),
             );
             let (x1, z1) = map_point(snapshot, points[0].x, points[0].z);
             let (x2, z2) = map_point(snapshot, points[1].x, points[1].z);
-            draw_thick_line(&mut canvas, x1, z1, x2, z2, color, 4);
+            draw_thick_line(&mut canvas, x1, z1, x2, z2, color, 2);
         }
     }
 
@@ -1026,43 +1034,56 @@ async fn render_map_png(
         1,
     );
 
-    for player in &snapshot.players {
-        let (x, z) = map_point(snapshot, player.x, player.z);
+    let player_points: Vec<_> = snapshot
+        .players
+        .iter()
+        .map(|player| map_point(snapshot, player.x, player.z))
+        .collect();
+    let compact_markers: Vec<_> = (0..snapshot.players.len())
+        .map(|index| has_nearby_player(index, &player_points, DENSE_PLAYER_DISTANCE_PX))
+        .collect();
+    let compact_points = compact_player_points(&player_points, &compact_markers);
+    let mut label_obstacles: Vec<_> = player_points
+        .iter()
+        .map(|&(x, z)| MapRect::new(x - 12, z - 12, 25, 25))
+        .collect();
+
+    for player_index in 0..snapshot.players.len() {
+        let player = &snapshot.players[player_index];
+        let (x, z) = if compact_markers[player_index] {
+            compact_points[player_index]
+        } else {
+            player_points[player_index]
+        };
         let player_color = player_map_color(&player.id, 255);
         let outline = if player.whitelisted {
             Rgba([245, 245, 245, 255])
         } else {
             Rgba([30, 30, 30, 255])
         };
-        draw_square(&mut canvas, x, z, 11, outline);
-        draw_square(&mut canvas, x, z, 10, player_color);
-        if let Some(url) = &player.skin_url
-            && let Some(skin) = fetch_skin(client, url).await
-        {
-            draw_skin_face(&mut canvas, x, z, &skin);
+        if compact_markers[player_index] {
+            draw_disk(&mut canvas, x, z, 4, outline);
+            draw_disk(&mut canvas, x, z, 3, player_color);
         } else {
-            draw_square(&mut canvas, x, z, 7, player_color);
+            draw_square(&mut canvas, x, z, 11, outline);
+            draw_square(&mut canvas, x, z, 10, player_color);
+            if let Some(url) = &player.skin_url
+                && let Some(skin) = fetch_skin(client, url).await
+            {
+                draw_skin_face(&mut canvas, x, z, &skin);
+            } else {
+                draw_square(&mut canvas, x, z, 7, player_color);
+            }
         }
-        let label: String = player.name.chars().take(24).collect();
+        if compact_markers[player_index] {
+            continue;
+        }
+        // Labels are useful only while they can be read. Keep a compact name and
+        // omit the whole label pair when it would cover another player or label.
+        let label: String = player.name.chars().take(16).collect();
         let label_width = label.chars().count() as i32 * 9;
         let name_x = x - label_width / 2;
         let name_z = z - 25;
-        draw_text(
-            &mut canvas,
-            name_x + 1,
-            name_z + 1,
-            &label,
-            Rgba([20, 20, 20, 255]),
-            1,
-        );
-        draw_text(
-            &mut canvas,
-            name_x,
-            name_z,
-            &label,
-            Rgba([255, 255, 255, 255]),
-            1,
-        );
         let coordinates = format!(
             "X{} Y{} Z{}",
             player.x.round() as i32,
@@ -1072,22 +1093,46 @@ async fn render_map_png(
         let coordinates_width = coordinates.chars().count() as i32 * 9;
         let coordinates_x = x - coordinates_width / 2;
         let coordinates_z = z + 15;
-        draw_text(
-            &mut canvas,
-            coordinates_x + 1,
-            coordinates_z + 1,
-            &coordinates,
-            Rgba([20, 20, 20, 255]),
-            1,
-        );
-        draw_text(
-            &mut canvas,
-            coordinates_x,
-            coordinates_z,
-            &coordinates,
-            Rgba([235, 235, 235, 255]),
-            1,
-        );
+        let name_bounds = MapRect::new(name_x, name_z, label_width, 8);
+        let coordinates_bounds = MapRect::new(coordinates_x, coordinates_z, coordinates_width, 8);
+        if !label_obstacles.iter().any(|obstacle| {
+            obstacle.intersects(name_bounds) || obstacle.intersects(coordinates_bounds)
+        }) {
+            draw_text(
+                &mut canvas,
+                name_x + 1,
+                name_z + 1,
+                &label,
+                Rgba([20, 20, 20, 255]),
+                1,
+            );
+            draw_text(
+                &mut canvas,
+                name_x,
+                name_z,
+                &label,
+                Rgba([255, 255, 255, 255]),
+                1,
+            );
+            draw_text(
+                &mut canvas,
+                coordinates_x + 1,
+                coordinates_z + 1,
+                &coordinates,
+                Rgba([20, 20, 20, 255]),
+                1,
+            );
+            draw_text(
+                &mut canvas,
+                coordinates_x,
+                coordinates_z,
+                &coordinates,
+                Rgba([235, 235, 235, 255]),
+                1,
+            );
+            label_obstacles.push(name_bounds);
+            label_obstacles.push(coordinates_bounds);
+        }
     }
 
     draw_text(&mut canvas, 12, 12, "N", Rgba([255, 255, 255, 255]), 2);
@@ -1113,17 +1158,95 @@ fn player_map_color(id: &str, alpha: u8) -> Rgba<u8> {
     Rgba([color[0], color[1], color[2], alpha])
 }
 
-const BREADCRUMB_MIN_Y: f64 = -64.0;
-const BREADCRUMB_MAX_Y: f64 = 320.0;
-
-fn breadcrumb_color(id: &str, y: f64, alpha: u8) -> Rgba<u8> {
-    let color = player_map_color(id, u8::MAX);
-    breadcrumb_height_color([color[0], color[1], color[2]], y, alpha)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MapRect {
+    x: i32,
+    z: i32,
+    width: i32,
+    height: i32,
 }
 
-fn breadcrumb_height_color(color: [u8; 3], y: f64, alpha: u8) -> Rgba<u8> {
-    let height = ((y - BREADCRUMB_MIN_Y) / (BREADCRUMB_MAX_Y - BREADCRUMB_MIN_Y)).clamp(0.0, 1.0);
-    let brightness = 0.55 + height * 0.65;
+impl MapRect {
+    fn new(x: i32, z: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            z,
+            width,
+            height,
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.x < other.x + other.width
+            && self.x + self.width > other.x
+            && self.z < other.z + other.height
+            && self.z + self.height > other.z
+    }
+}
+
+fn has_nearby_player(index: usize, points: &[(i32, i32)], distance: i32) -> bool {
+    let max_distance_squared = distance * distance;
+    points.iter().enumerate().any(|(candidate, &(x, z))| {
+        if candidate == index {
+            return false;
+        }
+        let dx = points[index].0 - x;
+        let dz = points[index].1 - z;
+        dx * dx + dz * dz <= max_distance_squared
+    })
+}
+
+/// Spreads only overlapping compact dots by a few pixels. Every dot remains an
+/// individual player marker, while near-but-not-overlapping locations stay exact.
+fn compact_player_points(points: &[(i32, i32)], compact: &[bool]) -> Vec<(i32, i32)> {
+    const OFFSETS: &[(i32, i32)] = &[
+        (0, 0),
+        (8, 0),
+        (-8, 0),
+        (0, 8),
+        (0, -8),
+        (6, 6),
+        (-6, 6),
+        (6, -6),
+        (-6, -6),
+        (16, 0),
+        (-16, 0),
+        (0, 16),
+        (0, -16),
+    ];
+    let mut result = points.to_vec();
+    for index in 0..points.len() {
+        if !compact[index] {
+            continue;
+        }
+        for &(offset_x, offset_z) in OFFSETS {
+            let candidate = (points[index].0 + offset_x, points[index].1 + offset_z);
+            if result[..index].iter().enumerate().all(|(other, &placed)| {
+                !compact[other]
+                    || (candidate.0 - placed.0).pow(2) + (candidate.1 - placed.1).pow(2) >= 64
+            }) {
+                result[index] = candidate;
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn breadcrumb_color(id: &str, y: f64, min_y: f64, max_y: f64, alpha: u8) -> Rgba<u8> {
+    let color = player_map_color(id, u8::MAX);
+    breadcrumb_height_color([color[0], color[1], color[2]], y, min_y, max_y, alpha)
+}
+
+fn breadcrumb_height_color(color: [u8; 3], y: f64, min_y: f64, max_y: f64, alpha: u8) -> Rgba<u8> {
+    // A flat trail sits at the middle brightness. The endpoints intentionally
+    // stay away from black and white so the terrain remains visible beneath it.
+    let height = if (max_y - min_y).abs() < f64::EPSILON {
+        0.5
+    } else {
+        ((y - min_y) / (max_y - min_y)).clamp(0.0, 1.0)
+    };
+    let brightness = 0.60 + height * 0.35;
     Rgba([
         (f64::from(color[0]) * brightness).clamp(0.0, 255.0) as u8,
         (f64::from(color[1]) * brightness).clamp(0.0, 255.0) as u8,
@@ -2282,11 +2405,47 @@ mod tests {
 
     #[test]
     fn higher_breadcrumbs_are_lighter() {
-        let low = breadcrumb_height_color([100, 100, 100], -64.0, 255);
-        let high = breadcrumb_height_color([100, 100, 100], 320.0, 255);
+        let low = breadcrumb_height_color([100, 100, 100], 40.0, 40.0, 90.0, 255);
+        let high = breadcrumb_height_color([100, 100, 100], 90.0, 40.0, 90.0, 255);
 
         assert!(high[0] > low[0]);
         assert!(high[1] > low[1]);
         assert!(high[2] > low[2]);
+    }
+
+    #[test]
+    fn breadcrumb_height_scale_never_reaches_black_or_white() {
+        let low = breadcrumb_height_color([255, 255, 255], 0.0, 0.0, 100.0, 255);
+        let high = breadcrumb_height_color([255, 255, 255], 100.0, 0.0, 100.0, 255);
+
+        for color in [low, high] {
+            assert!(
+                color.0[..3]
+                    .iter()
+                    .all(|&channel| channel > 0 && channel < 255)
+            );
+        }
+    }
+
+    #[test]
+    fn detects_nearby_players_without_creating_groups() {
+        let points = [(100, 100), (120, 110), (300, 300)];
+
+        assert!(has_nearby_player(0, &points, 32));
+        assert!(has_nearby_player(1, &points, 32));
+        assert!(!has_nearby_player(2, &points, 32));
+    }
+
+    #[test]
+    fn compact_dots_are_separated_when_players_share_a_map_pixel() {
+        let compact_points = compact_player_points(&[(100, 100), (100, 100)], &[true, true]);
+
+        assert_ne!(compact_points[0], compact_points[1]);
+    }
+
+    #[test]
+    fn map_rects_detect_overlapping_text() {
+        assert!(MapRect::new(10, 10, 20, 8).intersects(MapRect::new(25, 12, 20, 8)));
+        assert!(!MapRect::new(10, 10, 20, 8).intersects(MapRect::new(30, 10, 20, 8)));
     }
 }

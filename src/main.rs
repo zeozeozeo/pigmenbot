@@ -35,7 +35,7 @@ use base64::{
 };
 use clap::{Parser, ValueEnum};
 use font8x8::UnicodeFonts;
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MIN_HEALTH: f32 = 6.0;
@@ -69,16 +69,6 @@ const PLAYER_MAP_COLORS: [[u8; 3]; 8] = [
     [255, 112, 67],
     [124, 179, 66],
     [255, 112, 181],
-];
-const BREADCRUMB_COLORS: [[u8; 3]; 8] = [
-    [239, 83, 80],
-    [66, 165, 245],
-    [255, 202, 40],
-    [171, 71, 188],
-    [0, 188, 212],
-    [255, 112, 67],
-    [236, 64, 122],
-    [121, 85, 72],
 ];
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -1066,23 +1056,25 @@ async fn render_map_png(
             player_points[player_index]
         };
         let player_color = player_map_color(&player.id, 255);
-        let outline = if player.whitelisted {
-            Rgba([245, 245, 245, 255])
-        } else {
-            Rgba([30, 30, 30, 255])
-        };
         if compact_markers[player_index] {
-            draw_disk(&mut canvas, x, z, 4, outline);
+            draw_disk(&mut canvas, x, z, 4, Rgba([0, 0, 0, 255]));
             draw_disk(&mut canvas, x, z, 3, player_color);
         } else {
-            draw_square(&mut canvas, x, z, 11, outline);
-            draw_square(&mut canvas, x, z, 10, player_color);
             if let Some(url) = &player.skin_url
                 && let Some(skin) = fetch_skin(client, url).await
+                && !skin_face_is_solid_green(&skin)
             {
+                let outline = if player.whitelisted {
+                    Rgba([245, 245, 245, 255])
+                } else {
+                    Rgba([30, 30, 30, 255])
+                };
+                draw_square(&mut canvas, x, z, 11, outline);
+                draw_square(&mut canvas, x, z, 10, player_color);
                 draw_skin_face(&mut canvas, x, z, &skin);
             } else {
-                draw_square(&mut canvas, x, z, 7, player_color);
+                draw_disk(&mut canvas, x, z, 5, Rgba([0, 0, 0, 255]));
+                draw_disk(&mut canvas, x, z, 4, player_color);
             }
         }
         if compact_markers[player_index] {
@@ -1161,8 +1153,10 @@ async fn render_map_png(
 }
 
 fn player_map_color(id: &str, alpha: u8) -> Rgba<u8> {
-    let hash = map_color_hash(id);
-    let color = PLAYER_MAP_COLORS[(hash as usize) % PLAYER_MAP_COLORS.len()];
+    let color = locator_bar_color(id).unwrap_or_else(|| {
+        let hash = map_color_hash(id);
+        PLAYER_MAP_COLORS[(hash as usize) % PLAYER_MAP_COLORS.len()]
+    });
     Rgba([color[0], color[1], color[2], alpha])
 }
 
@@ -1170,6 +1164,32 @@ fn map_color_hash(id: &str) -> u32 {
     id.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     })
+}
+
+/// Minecraft's locator bar derives its RGB color from `UUID.hashCode()`.
+fn locator_bar_color(uuid: &str) -> Option<[u8; 3]> {
+    let parts: Vec<_> = uuid.split('-').collect();
+    let [first, second, third, fourth, fifth] = parts.as_slice() else {
+        return None;
+    };
+    if first.len() != 8
+        || second.len() != 4
+        || third.len() != 4
+        || fourth.len() != 4
+        || fifth.len() != 12
+    {
+        return None;
+    }
+    let first = u64::from_str_radix(first, 16).ok()?;
+    let second = u64::from_str_radix(second, 16).ok()?;
+    let third = u64::from_str_radix(third, 16).ok()?;
+    let fourth = u64::from_str_radix(fourth, 16).ok()?;
+    let fifth = u64::from_str_radix(fifth, 16).ok()?;
+    let most = (first << 32) | (second << 16) | third;
+    let least = (fourth << 48) | fifth;
+    let mixed = most ^ least;
+    let hash = (mixed ^ (mixed >> 32)) as u32;
+    Some([(hash >> 16) as u8, (hash >> 8) as u8, hash as u8])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1248,8 +1268,8 @@ fn compact_player_points(points: &[(i32, i32)], compact: &[bool]) -> Vec<(i32, i
 }
 
 fn breadcrumb_color(id: &str, y: f64, min_y: f64, max_y: f64, alpha: u8) -> Rgba<u8> {
-    let color = BREADCRUMB_COLORS[(map_color_hash(id) as usize) % BREADCRUMB_COLORS.len()];
-    breadcrumb_height_color(color, y, min_y, max_y, alpha)
+    let color = player_map_color(id, u8::MAX);
+    breadcrumb_height_color([color[0], color[1], color[2]], y, min_y, max_y, alpha)
 }
 
 fn breadcrumb_height_color(color: [u8; 3], y: f64, min_y: f64, max_y: f64, alpha: u8) -> Rgba<u8> {
@@ -1775,6 +1795,20 @@ fn draw_skin_face(image: &mut RgbaImage, center_x: i32, center_z: i32, skin: &Dy
         i64::from(center_x - 8),
         i64::from(center_z - 8),
     );
+}
+
+fn skin_face_is_solid_green(skin: &DynamicImage) -> bool {
+    if skin.width() < 16 || skin.height() < 16 {
+        return true;
+    }
+    (8..16).all(|x| {
+        (8..16).all(|z| {
+            let pixel = skin.get_pixel(x, z);
+            pixel[3] > 0
+                && pixel[1] > pixel[0].saturating_add(32)
+                && pixel[1] > pixel[2].saturating_add(32)
+        })
+    })
 }
 
 fn draw_line(image: &mut RgbaImage, mut x1: i32, mut z1: i32, x2: i32, z2: i32, color: Rgba<u8>) {
@@ -2439,6 +2473,24 @@ mod tests {
                     .all(|&channel| channel > 0 && channel < 255)
             );
         }
+    }
+
+    #[test]
+    fn locator_color_matches_minecraft_uuid_hash() {
+        assert_eq!(
+            locator_bar_color("00000000-0000-0000-0000-000000112233"),
+            Some([0x11, 0x22, 0x33])
+        );
+    }
+
+    #[test]
+    fn detects_a_solid_green_placeholder_skin() {
+        let green = DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([0, 255, 0, 255])));
+        let normal =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([120, 80, 60, 255])));
+
+        assert!(skin_face_is_solid_green(&green));
+        assert!(!skin_face_is_solid_green(&normal));
     }
 
     #[test]
